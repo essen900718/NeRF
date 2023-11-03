@@ -90,7 +90,16 @@ def render_rays(ray_batch,
         sample.
     """
 
-    def raw2outputs(raw, z_vals, rays_d):
+    '''
+    步驟:
+    放置採樣點(要在哪個位置sample)
+    先計算每個點的透明度(密度跟透明度不同) 透明度 alpha = 1-e^(delta*sigma) (delta是每個點之間的距離)
+    最終顏色c^ = c1a1 + c2a2(1-a1) + ... + cnan(1-a1)(1-a2)...(1-an-1) 因為前面的點會擋住後面的點 所以前面的點的權重比較大
+    這些 a1 a2(1-a1) an(1-a1)(1-a2)...(1-an-1) 被稱為 transmittance
+    舉例來說 c2這個點的顏色會為 c2a2(1-a1) (顏色乘透明度) 會等於 c2(顏色)*a2(c2的透明度)*(1-a1)(在c1時沒被擋住的機率) 
+    '''
+
+    def raw2outputs(raw, z_vals, rays_d): 
         """Transforms model's predictions to semantically meaningful values.
 
         Args:
@@ -107,11 +116,16 @@ def render_rays(ray_batch,
         """
         # Function for computing density from model prediction. This value is
         # strictly between [0, 1].
-        def raw2alpha(raw, dists, act_fn=tf.nn.relu): return 1.0 - \
-            tf.exp(-act_fn(raw) * dists)
+        def raw2alpha(raw, dists, act_fn=tf.nn.relu): 
+            return 1.0 - tf.exp(-act_fn(raw) * dists) # 1-e^(delta*sigma)
 
         # Compute 'distance' (in time) between each integration time along a ray.
-        dists = z_vals[..., 1:] - z_vals[..., :-1]
+        dists = z_vals[..., 1:] - z_vals[..., :-1] 
+        # z_vals = [z1, z2, ..., zn], 
+        # z_vals[...,  1:] 取 z1 之後的所有數 [z2, z3, ...,   zn]
+        # z_vals[..., :-1] 取 zn 之前的所有數 [z1, z2, ..., zn-1]
+        # 相減得到兩點間的距離 [z2-z1, z3-z2,...,zn-(zn-1)]
+        # 兩點之間的距離在第一階段coarse sample的時候不會改變 但在第二階段fine sample的時候會改變
 
         # The 'distance' from the last integration time is infinity.
         dists = tf.concat(
@@ -121,6 +135,7 @@ def render_rays(ray_batch,
         # Multiply each distance by the norm of its corresponding direction ray
         # to convert to real world distance (accounts for non-unit directions).
         dists = dists * tf.linalg.norm(rays_d[..., None, :], axis=-1)
+        # 因為每個射線的長度會因為角度不同而不一樣長
 
         # Extract RGB of each sample position along each ray.
         rgb = tf.math.sigmoid(raw[..., :3])  # [N_rays, N_samples, 3]
@@ -141,6 +156,8 @@ def render_rays(ray_batch,
         # [N_rays, N_samples]
         weights = alpha * \
             tf.math.cumprod(1.-alpha + 1e-10, axis=-1, exclusive=True)
+        # cumprod [1, (1-a1), (1-a1)(1-a2), ..., (1-a1)(1-a2)...(1-an-1)]
+        # weights [a1, a2(1-a1), a3(1-a1)(1-a2), ..., an(1-a1)(1-a2)...(1-an-1)]
 
         # Computed weighted color of each sample along each ray.
         rgb_map = tf.reduce_sum(
@@ -178,6 +195,7 @@ def render_rays(ray_batch,
 
     # Decide where to sample along each ray. Under the logic, all rays will be sampled at
     # the same times.
+    # 放置採樣點 兩個階段不同
     t_vals = tf.linspace(0., 1., N_samples)
     if not lindisp:
         # Space integration times linearly between 'near' and 'far'. Same
@@ -188,6 +206,8 @@ def render_rays(ray_batch,
         z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
     z_vals = tf.broadcast_to(z_vals, [N_rays, N_samples])
 
+    # stage 1 sampling
+    # 加入一些亂數擾動 雖然說是等距擺放 但實際上還是會有一點隨機 (在等距的位置附近隨機擺放)
     # Perturb sampling time along each ray.
     if perturb > 0.:
         # get intervals between samples
@@ -199,20 +219,27 @@ def render_rays(ray_batch,
         z_vals = lower + (upper - lower) * t_rand
 
     # Points in space to evaluate model at.
+    # rays_o (N_rays, 3) 每個rays是長度為3的一個向量 -> (N_rays, 1, 3)
+    # rays_d (N_rays, 3)                           -> (N_rays, 1, 3)
+    # z_vals (N_rays, N_samples)                   -> (N_rays, N_samples, 1)
+    # rays_d*z_vals -> (N_rays, N_samples, 3) 
     pts = rays_o[..., None, :] + rays_d[..., None, :] * \
         z_vals[..., :, None]  # [N_rays, N_samples, 3]
 
     # Evaluate model at each point.
     raw = network_query_fn(pts, viewdirs, network_fn)  # [N_rays, N_samples, 4]
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
-        raw, z_vals, rays_d)
+        raw, z_vals, rays_d) # weights stage 1 output 的 weights 分布
 
+    # stage 2 sampling
     if N_importance > 0:
         rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
 
         # Obtain additional integration times to evaluate based on the weights
         # assigned to colors in the coarse model.
         z_vals_mid = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
+        # 利用 stage 1 output 的 weights 分布來 sample 新的點
+        # (是在 weights 大的地方採樣 不是在 sigma大的地方採樣)
         z_samples = sample_pdf(
             z_vals_mid, weights[..., 1:-1], N_importance, det=(perturb == 0.))
         z_samples = tf.stop_gradient(z_samples)
@@ -245,6 +272,9 @@ def render_rays(ray_batch,
 
 def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     """Render rays in smaller minibatches to avoid OOM."""
+    # 把剛剛的rays再做細分
+    # coarse 預設的採樣點是64 fine預設的採樣點是192 總共有256採樣點
+    # 每次訓練的時候預設的batch size 是 1024 所以每一次丟給network的資料是1024*256 但memory會太多 因此需要做chunk 每次一次丟一點點
     all_ret = {}
     for i in range(0, rays_flat.shape[0], chunk):
         ret = render_rays(rays_flat[i:i+chunk], **kwargs)
@@ -294,7 +324,7 @@ def render(H, W, focal,
         # use provided ray batch
         rays_o, rays_d = rays
 
-    if use_viewdirs:
+    if use_viewdirs: # 顏色會因為視角的不同而不同
         # provide ray directions as input
         viewdirs = rays_d
         if c2w_staticcam is not None:
@@ -303,7 +333,7 @@ def render(H, W, focal,
 
         # Make all directions unit magnitude.
         # shape: [batch_size, 3]
-        viewdirs = viewdirs / tf.linalg.norm(viewdirs, axis=-1, keepdims=True)
+        viewdirs = viewdirs / tf.linalg.norm(viewdirs, axis=-1, keepdims=True) # 正規化
         viewdirs = tf.cast(tf.reshape(viewdirs, [-1, 3]), dtype=tf.float32)
 
     sh = rays_d.shape  # [..., 3]
@@ -316,13 +346,13 @@ def render(H, W, focal,
     rays_o = tf.cast(tf.reshape(rays_o, [-1, 3]), dtype=tf.float32)
     rays_d = tf.cast(tf.reshape(rays_d, [-1, 3]), dtype=tf.float32)
     near, far = near * \
-        tf.ones_like(rays_d[..., :1]), far * tf.ones_like(rays_d[..., :1])
+        tf.ones_like(rays_d[..., :1]), far * tf.ones_like(rays_d[..., :1]) # [N_rand, 1]
 
     # (ray origin, ray direction, min dist, max dist) for each ray
-    rays = tf.concat([rays_o, rays_d, near, far], axis=-1)
+    rays = tf.concat([rays_o, rays_d, near, far], axis=-1) # [N_rand, 3+3+1+1]
     if use_viewdirs:
         # (ray origin, ray direction, min dist, max dist, normalized viewing direction)
-        rays = tf.concat([rays, viewdirs], axis=-1)
+        rays = tf.concat([rays, viewdirs], axis=-1) # [N_rand, 3+3+1+1+3]
 
     # Render and reshape
     all_ret = batchify_rays(rays, chunk, **kwargs)
@@ -378,7 +408,7 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
 def create_nerf(args):
     """Instantiate NeRF's MLP model."""
 
-    embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
+    embed_fn, input_ch = get_embedder(args.multires, args.i_embed) #positional encoding
 
     input_ch_views = 0
     embeddirs_fn = None
@@ -407,7 +437,7 @@ def create_nerf(args):
         inputs, viewdirs, network_fn,
         embed_fn=embed_fn,
         embeddirs_fn=embeddirs_fn,
-        netchunk=args.netchunk)
+        netchunk=args.netchunk) # 把輸入傳到positional encoding後再傳進網路最後輸出
 
     render_kwargs_train = {
         'network_query_fn': network_query_fn,
@@ -472,7 +502,7 @@ def config_parser():
 
     # training options
     parser.add_argument("--netdepth", type=int, default=8,
-                        help='layers in network')
+                        help='layers in network') 
     parser.add_argument("--netwidth", type=int, default=256,
                         help='channels per layer')
     parser.add_argument("--netdepth_fine", type=int,
@@ -577,14 +607,14 @@ def train():
     parser = config_parser()
     args = parser.parse_args()
     
-    if args.random_seed is not None:
+    if args.random_seed is not None: # 設定實驗亂數
         print('Fixing random seed', args.random_seed)
         np.random.seed(args.random_seed)
         tf.compat.v1.set_random_seed(args.random_seed)
 
     # Load data
 
-    if args.dataset_type == 'llff':
+    if args.dataset_type == 'llff': # 實際拍攝的照片
         images, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor,
                                                                   recenter=True, bd_factor=.75,
                                                                   spherify=args.spherify)
@@ -612,22 +642,30 @@ def train():
             far = 1.
         print('NEAR FAR', near, far)
 
-    elif args.dataset_type == 'blender':
+    elif args.dataset_type == 'blender': # 用3D合成器合成渲染的照片(blender)
         images, poses, render_poses, hwf, i_split = load_blender_data(
-            args.datadir, args.half_res, args.testskip)
+            args.datadir, args.half_res, args.testskip) # 回傳 所有的圖片 圖片的位姿 X 圖片長寬跟焦距[W, H, focal] 每個split有多少張圖片
         print('Loaded blender', images.shape,
               render_poses.shape, hwf, args.datadir)
         i_train, i_val, i_test = i_split
 
+        # 物體處在的平面 最遠跟最近的平面
         near = 2.
         far = 6.
 
-        if args.white_bkgd:
+        if args.white_bkgd: # 圖片的背景是不是白色的
+            # images.shape [n, h, w, 4] (n:total number of images)
+            # if images[..., -1:] == 1: (opaque有物體)
+            #    images RGB unchanged
+            # if iamges[..., -1:] == 0: (transparent 透明)
+            #    images will be white
+            # 上面的過程是在把圖片透明的地方變成白色
+            # blender出來的圖片不是物體的地方是透明的 所以會執行這一行
             images = images[..., :3]*images[..., -1:] + (1.-images[..., -1:])
         else:
             images = images[..., :3]
 
-    elif args.dataset_type == 'deepvoxels':
+    elif args.dataset_type == 'deepvoxels': # 之前論文使用的資料集
 
         images, poses, render_poses, hwf, i_split = load_dv_data(scene=args.shape,
                                                                  basedir=args.datadir,
@@ -668,8 +706,8 @@ def train():
             file.write(open(args.config, 'r').read())
 
     # Create nerf model
-    render_kwargs_train, render_kwargs_test, start, grad_vars, models = create_nerf(
-        args)
+    render_kwargs_train, render_kwargs_test, \
+        start, grad_vars, models = create_nerf(args)
 
     bds_dict = {
         'near': tf.cast(near, tf.float32),
@@ -715,7 +753,7 @@ def train():
     # Prepare raybatch tensor if batching random rays
     N_rand = args.N_rand
     use_batching = not args.no_batching
-    if use_batching:
+    if use_batching: # use_batching:把所有的資料平均對待 隨機取X個當batch no_batching:隨機取一張照片 這些像素當一個batch
         # For random ray batching.
         #
         # Constructs an array 'rays_rgb' of shape [N*H*W, 3, 3] where axis=1 is
@@ -729,21 +767,22 @@ def train():
         rays = [get_rays_np(H, W, focal, p) for p in poses[:, :3, :4]]
         rays = np.stack(rays, axis=0)  # [N, ro+rd, H, W, 3]
         print('done, concats')
-        # [N, ro+rd+rgb, H, W, 3]
-        rays_rgb = np.concatenate([rays, images[:, None, ...]], 1)
+        # images [N, H, W, 3]
+        # images[:, None, ...] == np.expand_dims(images, 1) [N, 1, H, W, 3]
+        rays_rgb = np.concatenate([rays, images[:, None, ...]], 1) # [N, ro+rd+rgb, H, W, 3]
         # [N, H, W, ro+rd+rgb, 3]
-        rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])
+        rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4]) # [N, H, W, ro+rd+rgb, 3]
         rays_rgb = np.stack([rays_rgb[i]
                              for i in i_train], axis=0)  # train images only
         # [(N-1)*H*W, ro+rd+rgb, 3]
-        rays_rgb = np.reshape(rays_rgb, [-1, 3, 3])
+        rays_rgb = np.reshape(rays_rgb, [-1, 3, 3]) # ro,rd,rgb and 3 channel
         rays_rgb = rays_rgb.astype(np.float32)
         print('shuffle rays')
         np.random.shuffle(rays_rgb)
         print('done')
         i_batch = 0
 
-    N_iters = 1000000
+    N_iters = 1_000_000
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
@@ -809,7 +848,7 @@ def train():
             # Make predictions for color, disparity, accumulated opacity.
             rgb, disp, acc, extras = render(
                 H, W, focal, chunk=args.chunk, rays=batch_rays,
-                verbose=i < 10, retraw=True, **render_kwargs_train)
+                verbose=i < 10, retraw=True, **render_kwargs_train) # 要把預測出的顏色和實際的顏色計算後對比算loss
 
             # Compute MSE loss between predicted and true RGB.
             img_loss = img2mse(rgb, target_s)

@@ -65,7 +65,7 @@ def get_embedder(multires, i=0):
         'include_input': True,
         'input_dims': 3,
         'max_freq_log2': multires-1,
-        'num_freqs': multires,
+        'num_freqs': multires, # 頻率個數 
         'log_sampling': True,
         'periodic_fns': [tf.math.sin, tf.math.cos],
     }
@@ -78,7 +78,7 @@ def get_embedder(multires, i=0):
 # Model architecture
 
 def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
-
+    # input_ch, input_ch_view 會變成 64和27 (加上positional encoding)
     relu = tf.keras.layers.ReLU()
     def dense(W, act=relu): return tf.keras.layers.Dense(W, activation=act)
 
@@ -88,19 +88,23 @@ def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips
     input_ch_views = int(input_ch_views)
 
     inputs = tf.keras.Input(shape=(input_ch + input_ch_views))
-    inputs_pts, inputs_views = tf.split(inputs, [input_ch, input_ch_views], -1)
+    inputs_pts, inputs_views = tf.split(inputs, [input_ch, input_ch_views], -1) # 切成 xyz 和 direction
     inputs_pts.set_shape([None, input_ch])
     inputs_views.set_shape([None, input_ch_views])
 
+    # 網路總共有10層 前九層256 最後一層128
+    # 在第五層會有一個skip connection
+    # 在第九層的時候會先輸出density 然後加入view direction再計算這個角度下的顏色 最後輸出
+    # 建造多層 Dense層
     print(inputs.shape, inputs_pts.shape, inputs_views.shape)
     outputs = inputs_pts
     for i in range(D):
         outputs = dense(W)(outputs)
-        if i in skips:
+        if i in skips: # skip connection
             outputs = tf.concat([inputs_pts, outputs], -1)
 
     if use_viewdirs:
-        alpha_out = dense(1, act=None)(outputs)
+        alpha_out = dense(1, act=None)(outputs) # 輸出的密度
         bottleneck = dense(256, act=None)(outputs)
         inputs_viewdirs = tf.concat(
             [bottleneck, inputs_views], -1)  # concat viewdirs
@@ -109,8 +113,8 @@ def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips
         # the experiments were actually run with 1 hidden layer, so we will leave it as 1.
         for i in range(1):
             outputs = dense(W//2)(outputs)
-        outputs = dense(3, act=None)(outputs)
-        outputs = tf.concat([outputs, alpha_out], -1)
+        outputs = dense(3, act=None)(outputs) # outputs = rgb
+        outputs = tf.concat([outputs, alpha_out], -1) # [B, 4]
     else:
         outputs = dense(output_ch, act=None)(outputs)
 
@@ -131,12 +135,13 @@ def get_rays(H, W, focal, c2w):
 
 
 def get_rays_np(H, W, focal, c2w):
-    """Get ray origins, directions from a pinhole camera."""
+    """Get ray origins, directions from a pinhole camera.""" # 要取得通過照相機原點和該pixel的那條射線
+    # https://www.scratchapixel.com/lessons/3d-basic-rendering/ray-tracing-generating-camera-rays/generating-camera-rays.html
     i, j = np.meshgrid(np.arange(W, dtype=np.float32),
                        np.arange(H, dtype=np.float32), indexing='xy')
     dirs = np.stack([(i-W*.5)/focal, -(j-H*.5)/focal, -np.ones_like(i)], -1)
-    rays_d = np.sum(dirs[..., np.newaxis, :] * c2w[:3, :3], -1)
-    rays_o = np.broadcast_to(c2w[:3, -1], np.shape(rays_d))
+    rays_d = np.sum(dirs[..., np.newaxis, :] * c2w[:3, :3], -1) # 把照相機的座標轉到世界座標(direction dot c2w) <- 跟程式碼計算方式不一樣但是是一樣的事
+    rays_o = np.broadcast_to(c2w[:3, -1], np.shape(rays_d)) # (h*w, 3) (h*w, 3) 每一個射線的原點跟方向 (全部總共有h*w個射線，每一條射線有三個座標)
     return rays_o, rays_d
 
 
@@ -182,10 +187,14 @@ def ndc_rays(H, W, focal, near, rays_o, rays_d):
 
 def sample_pdf(bins, weights, N_samples, det=False):
 
+    '''
+    具體來說 他是把網路輸出的權重和所有的採樣點來計算 cumulative distribution
+    接著就會在比較高的地方做採樣
+    '''
     # Get pdf
     weights += 1e-5  # prevent nans
     pdf = weights / tf.reduce_sum(weights, -1, keepdims=True)
-    cdf = tf.cumsum(pdf, -1)
+    cdf = tf.cumsum(pdf, -1) #計算 cdf
     cdf = tf.concat([tf.zeros_like(cdf[..., :1]), cdf], -1)
 
     # Take uniform samples
@@ -194,7 +203,7 @@ def sample_pdf(bins, weights, N_samples, det=False):
         u = tf.broadcast_to(u, list(cdf.shape[:-1]) + [N_samples])
     else:
         u = tf.random.uniform(list(cdf.shape[:-1]) + [N_samples])
-
+        # 取縱軸的uniform的點
     # Invert CDF
     inds = tf.searchsorted(cdf, u, side='right')
     below = tf.maximum(0, inds-1)
